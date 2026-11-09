@@ -175,7 +175,18 @@ decode_response_refuses_external_entity_test() ->
 decode_response_refuses_oversize_test() ->
     Xml = oversize_xml(600 * 1024),
     ?assertEqual({error, payload_too_large},
-                 decode_response(undefined, base64:encode(Xml))).
+                 decode_response(undefined, base64:encode(Xml))),
+    %% DEFLATE data over 512 KB that inflates to a small valid response.
+    %% Each 5-byte prefix is an empty, non-final stored block.
+    Padded = <<(binary:copy(<<0, 0, 0, 16#FF, 16#FF>>, 110000))/binary,
+               (zlib:zip(response_xml()))/binary>>,
+    ?assert(byte_size(Padded) > 524288),
+    ?assertMatch(#xmlElement{name = 'samlp:Response'},
+                 scan_payload(zlib:unzip(Padded))),
+    ?assertEqual({error, payload_too_large},
+                 decode_response(?deflate, base64:encode(Padded))),
+    ?assertEqual({error, payload_too_large},
+                 decode_response(undefined, base64:encode(Padded))).
 
 decode_response_refuses_inflated_oversize_test() ->
     Zipped = zlib:zip(oversize_xml(2 * 1024 * 1024)),
@@ -183,7 +194,19 @@ decode_response_refuses_inflated_oversize_test() ->
     ?assertEqual({error, payload_too_large},
                  decode_response(?deflate, base64:encode(Zipped))),
     ?assertEqual({error, payload_too_large},
-                 decode_response(undefined, base64:encode(Zipped))).
+                 decode_response(undefined, base64:encode(Zipped))),
+    %% Bad DEFLATE data follows 2 MB of valid output. A full inflation
+    %% raises data_error. The bounded inflation stops at 512 KB first.
+    Z = zlib:open(),
+    ok = zlib:deflateInit(Z, default, deflated, -15, 8, default),
+    Head = iolist_to_binary(zlib:deflate(Z, oversize_xml(2 * 1024 * 1024), sync)),
+    zlib:close(Z),
+    Broken = <<Head/binary, 16#FF, 16#FF>>,
+    ?assertError(data_error, zlib:unzip(Broken)),
+    ?assertEqual({error, payload_too_large},
+                 decode_response(?deflate, base64:encode(Broken))),
+    ?assertEqual({error, payload_too_large},
+                 decode_response(undefined, base64:encode(Broken))).
 
 decode_response_refuses_utf16_test() ->
     Utf16 = unicode:characters_to_binary(doctype_xml(), utf8, {utf16, big}),

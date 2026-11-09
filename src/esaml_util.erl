@@ -357,10 +357,14 @@ scan_xml(Xml) ->
 refuse_fetch(_Spec, _State) ->
     {error, external_fetch_not_allowed}.
 
-%% @doc Inflate raw DEFLATE data. Stop when the output passes 512 KB.
+%% @doc Inflate raw DEFLATE data with a 512 KB limit.
 %%
+%% Refuse input that is over 512 KB before inflation starts.
+%% Stop the inflation when the output passes 512 KB.
 %% Raise error:data_error on data that is not raw DEFLATE, as zlib:unzip/1 does.
 -spec bounded_inflate(binary()) -> {ok, binary()} | {error, payload_too_large}.
+bounded_inflate(Data) when byte_size(Data) > ?MAX_XML_BYTES ->
+    {error, payload_too_large};
 bounded_inflate(Data) ->
     Z = zlib:open(),
     try
@@ -531,6 +535,25 @@ bounded_inflate_test() ->
     ?assertEqual({ok, <<"<r/>">>}, bounded_inflate(zlib:zip(<<"<r/>">>))),
     Big = <<"<r>", (binary:copy(<<"a">>, 2 * 1024 * 1024))/binary, "</r>">>,
     ?assertEqual({error, payload_too_large}, bounded_inflate(zlib:zip(Big))),
-    ?assertError(data_error, bounded_inflate(<<"<r/>">>)).
+    ?assertError(data_error, bounded_inflate(<<"<r/>">>)),
+    %% Input over 512 KB that inflates to a small document.
+    ?assertEqual({error, payload_too_large},
+                 bounded_inflate(<<(empty_stored_blocks(110000))/binary,
+                                   (zlib:zip(<<"<r/>">>))/binary>>)),
+    %% The inflation stops at the limit and never reads the bad data after it.
+    ?assertEqual({error, payload_too_large},
+                 bounded_inflate(<<(deflate_sync(Big))/binary, 16#FF, 16#FF>>)).
+
+%% Non-final stored DEFLATE blocks of length 0, 5 bytes each.
+empty_stored_blocks(N) ->
+    binary:copy(<<0, 0, 0, 16#FF, 16#FF>>, N).
+
+%% A raw DEFLATE stream with no final block. Data can follow it.
+deflate_sync(Data) ->
+    Z = zlib:open(),
+    ok = zlib:deflateInit(Z, default, deflated, -15, 8, default),
+    Out = iolist_to_binary(zlib:deflate(Z, Data, sync)),
+    zlib:close(Z),
+    Out.
 
 -endif.

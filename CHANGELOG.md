@@ -2,6 +2,15 @@
 
 All changes are in the `main` branch (`master` remains unchanged).
 
+### v4.6.0-optify.1
+Optify fork of the Hex 4.6.0 package. It closes the esaml 4.6.0 XXE advisory.
++   `esaml_binding:decode_response/2` refuses a payload that holds a DOCTYPE, holds a NUL byte (UTF-16 or UCS-4), or is over 512 KB. A refused payload returns `{error, Reason}` and does not crash.
++   The redirect and POST bindings refuse compressed input over 512 KB before inflation. The inflation stops when the output passes 512 KB.
++   xmerl parses with `{allow_entities, false}` and a `fetch_fun` that refuses every external read. xmerl fatal errors return `{error, {bad_xml, Reason}}`.
++   `esaml_sp:decrypt_assertion/2` applies the same checks to the decrypted EncryptedAssertion plaintext. Malformed decrypted XML now returns `{error, {bad_xml, Reason}}`, not `{error, bad_assertion}`.
++   `esaml_sp` validators and `esaml_cowboy` pass a decode refusal through as `{error, Reason}`.
++   Requires an xmerl that knows the `allow_entities` option. Tested on OTP 27.3.4.19.
+
 ### v4.6.0
 +   remove uri double encoding thanks to @DiaanEngelbrecht
 
