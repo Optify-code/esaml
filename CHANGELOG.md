@@ -2,6 +2,13 @@
 
 All changes are in the `main` branch (`master` remains unchanged).
 
+### v4.6.0-optify.2
+Closes the atom exhaustion advisories. xmerl and esaml no longer make new atoms from an untrusted payload.
++   `esaml_util:scan_untrusted_xml/1` reads the payload with the SAX parser before xmerl parses it. Every element name, attribute name, prefix, local name and namespace URI must already be an atom. The fork makes the SAML, XML-DSig and XML-Enc names into atoms once. Any other name returns `{error, unknown_xml_name}`.
++   A processing instruction returns `{error, processing_instruction_not_allowed}`. An XML declaration with an encoding other than UTF-8 returns `{error, encoding_not_allowed}`.
++   `esaml:status_code_map/1` maps the SAML 2.0 status codes to the atoms that 4.6.0 gave them. Any other status code maps to `unknown`.
++   `esaml:common_attrib_map/1` returns an attribute name as a string when it is not an atom yet. samly turns every attribute key into a string, so its keys do not change.
+
 ### v4.6.0-optify.1
 Optify fork of the Hex 4.6.0 package. It closes the esaml 4.6.0 XXE advisory.
 +   `esaml_binding:decode_response/2` refuses a payload that holds a DOCTYPE, holds a NUL byte (UTF-16 or UCS-4), or is over 512 KB. A refused payload returns `{error, Reason}` and does not crash.
