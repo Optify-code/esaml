@@ -319,15 +319,150 @@ unique_id() ->
 %%
 %% Refuse the payload before xmerl reads it when it is over 512 KB,
 %% when it holds a NUL byte (UTF-16 or UCS-4 can hide a DOCTYPE),
-%% or when it holds a DOCTYPE.
+%% when it holds a DOCTYPE, or when xmerl would make a new atom from it.
 -spec scan_untrusted_xml(binary()) ->
     {ok, #xmlElement{}} |
-    {error, payload_too_large | encoding_not_allowed | doctype_not_allowed | {bad_xml, term()}}.
+    {error, payload_too_large | encoding_not_allowed | doctype_not_allowed |
+            processing_instruction_not_allowed | unknown_xml_name | {bad_xml, term()}}.
 scan_untrusted_xml(Xml) when is_binary(Xml) ->
     case check_untrusted_xml(Xml) of
-        ok -> scan_xml(Xml);
-        {error, _} = Error -> Error
+        ok ->
+            case check_names(Xml) of
+                ok -> scan_xml(Xml);
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
     end.
+
+%% xmerl_scan makes an atom from each element and attribute name, each local
+%% name, each namespace URI and the declared encoding. Atoms are never freed,
+%% so a stream of unsigned posts with new names fills the atom table and stops
+%% the node. An untrusted payload may only use names that are atoms already.
+%% vocabulary/0 makes the SAML, XML-DSig and XML-Enc names into atoms once.
+%% The SAX parser reads names as strings, so this check makes no atoms.
+check_names(Xml) ->
+    ok = ensure_vocabulary(),
+    case check_encoding(Xml) of
+        ok ->
+            Opts = [{event_fun, fun name_event/3}, {event_state, ok}],
+            try xmerl_sax_parser:stream(Xml, Opts) of
+                {ok, ok, _Rest} -> ok;
+                %% The parser returns a {Tag, Reason} throw from name_event/3 with Tag first.
+                {refuse, _Loc, Reason, _EndTags, _State} -> {error, Reason};
+                {_Tag, _Loc, Reason, _EndTags, _State} -> {error, {bad_xml, Reason}};
+                {_Tag, Reason} -> {error, {bad_xml, Reason}}
+            catch
+                throw:{refuse, Reason} -> {error, Reason};
+                _:Reason -> {error, {bad_xml, Reason}}
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% xmerl_scan makes an atom from the encoding name in the XML declaration.
+%% SAML bindings use UTF-8, so only that encoding is accepted.
+check_encoding(Xml) ->
+    Re = <<"\\A(?:\\xEF\\xBB\\xBF)?\\s*<\\?xml\\s[^>]*?\\bencoding\\s*=\\s*[\"']([^\"']*)[\"']">>,
+    case re:run(Xml, Re, [{capture, all_but_first, list}]) of
+        nomatch -> ok;
+        {match, [Encoding]} ->
+            case string:lowercase(Encoding) of
+                "utf-8" -> require_atoms([Encoding]);
+                _ -> {error, encoding_not_allowed}
+            end
+    end.
+
+name_event({startPrefixMapping, Prefix, Uri}, _Loc, State) ->
+    ok = require_atoms_or_throw([Prefix, Uri, qname("xmlns", Prefix)]),
+    State;
+name_event({startElement, Uri, Local, {Prefix, Local}, Attributes}, _Loc, State) ->
+    ok = require_atoms_or_throw([Uri, Local, qname(Prefix, Local)]),
+    lists:foreach(fun({AttrUri, AttrPrefix, AttrLocal, _Value}) ->
+        ok = require_atoms_or_throw([AttrUri, AttrLocal, qname(AttrPrefix, AttrLocal)])
+    end, Attributes),
+    State;
+name_event({processingInstruction, _Target, _Data}, _Loc, _State) ->
+    throw({refuse, processing_instruction_not_allowed});
+name_event(_Event, _Loc, State) ->
+    State.
+
+qname("", Local) -> Local;
+qname(Prefix, "") -> Prefix;
+qname(Prefix, Local) -> Prefix ++ ":" ++ Local.
+
+require_atoms_or_throw(Names) ->
+    case require_atoms(Names) of
+        ok -> ok;
+        {error, Reason} -> throw({refuse, Reason})
+    end.
+
+require_atoms(Names) ->
+    try
+        lists:foreach(fun(Name) -> _ = list_to_existing_atom(Name) end, Names)
+    catch
+        error:badarg -> {error, unknown_xml_name}
+    end.
+
+ensure_vocabulary() ->
+    case persistent_term:get({?MODULE, vocabulary}, false) of
+        true ->
+            ok;
+        false ->
+            lists:foreach(fun(Name) -> _ = list_to_atom(Name) end, vocabulary()),
+            persistent_term:put({?MODULE, vocabulary}, true)
+    end.
+
+%% The names that real IdP messages use. Each prefix is combined with each
+%% local name, so an IdP may pick any of these prefixes.
+vocabulary() ->
+    Prefixes = ["saml", "saml2", "samlp", "saml2p", "ds", "dsig", "xenc", "xenc11", "xs",
+                "xsd", "xsi", "ec", "md", "xml", "xmlns"]
+               ++ ["ns" ++ integer_to_list(N) || N <- lists:seq(0, 9)],
+    Namespaces = ["urn:oasis:names:tc:SAML:2.0:protocol",
+                  "urn:oasis:names:tc:SAML:2.0:assertion",
+                  "urn:oasis:names:tc:SAML:2.0:metadata",
+                  "http://www.w3.org/2000/09/xmldsig#",
+                  "http://www.w3.org/2001/04/xmldsig-more#",
+                  "http://www.w3.org/2001/04/xmlenc#",
+                  "http://www.w3.org/2009/xmlenc11#",
+                  "http://www.w3.org/2001/10/xml-exc-c14n#",
+                  "http://www.w3.org/2001/XMLSchema",
+                  "http://www.w3.org/2001/XMLSchema-instance",
+                  "http://www.w3.org/XML/1998/namespace",
+                  "http://www.w3.org/2000/xmlns/"],
+    Locals = string:lexemes(
+        "AuthnRequest Response LogoutRequest LogoutResponse Status StatusCode StatusMessage "
+        "StatusDetail Extensions NameIDPolicy RequestedAuthnContext Scoping IDPList IDPEntry "
+        "GetComplete RequesterID SessionIndex ArtifactResolve ArtifactResponse Artifact "
+        "AttributeQuery AuthnQuery AuthzDecisionQuery SubjectQuery AssertionIDRequest "
+        "ManageNameIDRequest ManageNameIDResponse NewID NewEncryptedID Terminate "
+        "NameIDMappingRequest NameIDMappingResponse RespondTo "
+        "Assertion EncryptedAssertion Issuer Subject NameID BaseID EncryptedID SubjectConfirmation "
+        "SubjectConfirmationData Conditions Condition AudienceRestriction Audience OneTimeUse "
+        "ProxyRestriction Advice AssertionIDRef AssertionURIRef Statement AuthnStatement "
+        "SubjectLocality AuthnContext AuthnContextClassRef AuthnContextDeclRef AuthnContextDecl "
+        "AuthenticatingAuthority AttributeStatement Attribute AttributeValue EncryptedAttribute "
+        "AuthzDecisionStatement Action Evidence "
+        "Signature SignedInfo CanonicalizationMethod SignatureMethod Reference Transforms Transform "
+        "DigestMethod DigestValue SignatureValue KeyInfo KeyName KeyValue RSAKeyValue Modulus "
+        "Exponent DSAKeyValue X509Data X509Certificate X509IssuerSerial X509IssuerName "
+        "X509SerialNumber X509SubjectName X509SKI X509CRL RetrievalMethod Object Manifest "
+        "SignatureProperties SignatureProperty HMACOutputLength XPath PGPData SPKIData MgmtData "
+        "InclusiveNamespaces "
+        "EncryptedData EncryptedKey EncryptionMethod CipherData CipherValue CipherReference KeySize "
+        "OAEPparams MGF ReferenceList DataReference KeyReference CarriedKeyName AgreementMethod "
+        "EncryptionProperties EncryptionProperty "
+        "ID Id Version IssueInstant Destination Consent InResponseTo Format NameQualifier "
+        "SPNameQualifier SPProvidedID Method NotBefore NotOnOrAfter Recipient Address AuthnInstant "
+        "SessionNotOnOrAfter Name NameFormat FriendlyName Value Algorithm URI Type MimeType Encoding "
+        "PrefixList AllowCreate ForceAuthn IsPassive ProtocolBinding AssertionConsumerServiceURL "
+        "AssertionConsumerServiceIndex AttributeConsumingServiceIndex ProviderName Reason "
+        "Comparison ProxyCount Loc DNSName Resource Decision Namespace Count ProviderID "
+        "type nil lang space base", " "),
+    Names = Locals ++ Prefixes,
+    ["", "xmlns", "UTF-8", "utf-8"] ++ Namespaces ++ Names
+        ++ [P ++ ":" ++ N || P <- Prefixes, N <- Names].
 
 check_untrusted_xml(Xml) when byte_size(Xml) > ?MAX_XML_BYTES ->
     {error, payload_too_large};
@@ -555,5 +690,50 @@ deflate_sync(Data) ->
     Out = iolist_to_binary(zlib:deflate(Z, Data, sync)),
     zlib:close(Z),
     Out.
+
+%% A fresh name in each place where xmerl_scan makes an atom.
+fresh_name() ->
+    "esamlfresh" ++ integer_to_list(erlang:unique_integer([positive])).
+
+fresh_name_docs() ->
+    [N1, N2, N3, N4, N5] = [fresh_name() || _ <- lists:seq(1, 5)],
+    [list_to_binary(D) || D <- [
+        "<" ++ N1 ++ "/>",
+        "<saml:" ++ N1 ++ " xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\"/>",
+        "<" ++ N2 ++ ":Response xmlns:" ++ N2 ++ "=\"urn:oasis:names:tc:SAML:2.0:protocol\"/>",
+        "<Response xmlns=\"urn:" ++ N3 ++ "\"/>",
+        "<Response " ++ N4 ++ "=\"x\"/>",
+        "<Response xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" saml:" ++ N4 ++ "=\"x\"/>",
+        "<?xml version=\"1.0\" encoding=\"" ++ N5 ++ "\"?><Response/>",
+        "<Response><?" ++ N5 ++ " data?></Response>"
+    ]].
+
+scan_untrusted_xml_makes_no_new_atoms_test() ->
+    %% Load the parser modules first, so loading them does not count.
+    {ok, _} = scan_untrusted_xml(<<"<Response/>">>),
+    Docs = fresh_name_docs(),
+    Before = erlang:system_info(atom_count),
+    Results = [scan_untrusted_xml(D) || D <- Docs],
+    ?assertEqual(Before, erlang:system_info(atom_count)),
+    lists:foreach(fun({D, R}) -> ?assertMatch({{error, _}, _}, {R, D}) end,
+                  lists:zip(Docs, Results)).
+
+scan_untrusted_xml_refuses_unknown_names_test() ->
+    ?assertEqual({error, unknown_xml_name},
+                 scan_untrusted_xml(list_to_binary("<" ++ fresh_name() ++ "/>"))),
+    ?assertEqual({error, processing_instruction_not_allowed},
+                 scan_untrusted_xml(<<"<Response><?xml-stylesheet href=\"a\"?></Response>">>)),
+    ?assertEqual({error, encoding_not_allowed},
+                 scan_untrusted_xml(<<"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><Response/>">>)),
+    ?assertMatch({ok, #xmlElement{name = 'Response'}},
+                 scan_untrusted_xml(<<"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response/>">>)).
+
+scan_untrusted_xml_accepts_real_idp_responses_test() ->
+    Paths = filelib:wildcard("test/idp_responses/*.xml"),
+    ?assertEqual(6, length(Paths)),
+    lists:foreach(fun(Path) ->
+        {ok, Xml} = file:read_file(Path),
+        ?assertMatch({{ok, #xmlElement{}}, _}, {scan_untrusted_xml(Xml), Path})
+    end, Paths).
 
 -endif.
