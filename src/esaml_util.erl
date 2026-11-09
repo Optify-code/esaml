@@ -23,6 +23,10 @@
 -export([load_metadata/2, load_metadata/1]).
 -export([convert_fingerprints/1]).
 -export([unique_id/0]).
+-export([scan_untrusted_xml/1, bounded_inflate/1]).
+
+%% Real IdP responses are 5-100 KB. Refuse any payload over 512 KB.
+-define(MAX_XML_BYTES, 524288).
 
 %% @doc Converts various ascii hex/base64 fingerprint formats to binary
 -spec convert_fingerprints([string() | binary()]) -> [binary()].
@@ -311,6 +315,78 @@ unique_id() ->
       ++ integer_to_list(erlang:system_time())
       ++ integer_to_list(erlang:unique_integer([positive])).
 
+%% @doc Parse an untrusted SAML payload with xmerl.
+%%
+%% Refuse the payload before xmerl reads it when it is over 512 KB,
+%% when it holds a NUL byte (UTF-16 or UCS-4 can hide a DOCTYPE),
+%% or when it holds a DOCTYPE.
+-spec scan_untrusted_xml(binary()) ->
+    {ok, #xmlElement{}} |
+    {error, payload_too_large | encoding_not_allowed | doctype_not_allowed | {bad_xml, term()}}.
+scan_untrusted_xml(Xml) when is_binary(Xml) ->
+    case check_untrusted_xml(Xml) of
+        ok -> scan_xml(Xml);
+        {error, _} = Error -> Error
+    end.
+
+check_untrusted_xml(Xml) when byte_size(Xml) > ?MAX_XML_BYTES ->
+    {error, payload_too_large};
+check_untrusted_xml(Xml) ->
+    case binary:match(Xml, <<0>>) of
+        nomatch ->
+            case re:run(Xml, <<"<!DOCTYPE">>, [caseless, {capture, none}]) of
+                nomatch -> ok;
+                match -> {error, doctype_not_allowed}
+            end;
+        _ ->
+            {error, encoding_not_allowed}
+    end.
+
+%% xmerl options: no entity declarations, no external reads.
+%% The allow_entities option needs an xmerl that knows it (OTP 27.3.4.19 does).
+scan_xml(Xml) ->
+    Opts = [{namespace_conformant, true},
+            {allow_entities, false},
+            {fetch_fun, fun refuse_fetch/2}],
+    try xmerl_scan:string(binary_to_list(Xml), Opts) of
+        {Doc, _Rest} -> {ok, Doc}
+    catch
+        exit:{fatal, Reason} -> {error, {bad_xml, Reason}}
+    end.
+
+refuse_fetch(_Spec, _State) ->
+    {error, external_fetch_not_allowed}.
+
+%% @doc Inflate raw DEFLATE data. Stop when the output passes 512 KB.
+%%
+%% Raise error:data_error on data that is not raw DEFLATE, as zlib:unzip/1 does.
+-spec bounded_inflate(binary()) -> {ok, binary()} | {error, payload_too_large}.
+bounded_inflate(Data) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:inflateInit(Z, -15),
+        inflate_loop(Z, zlib:safeInflate(Z, Data), [], 0)
+    after
+        zlib:close(Z)
+    end.
+
+inflate_loop(Z, {continue, Out}, Acc, Size0) ->
+    Size = Size0 + iolist_size(Out),
+    case Size > ?MAX_XML_BYTES of
+        true -> {error, payload_too_large};
+        false -> inflate_loop(Z, zlib:safeInflate(Z, []), [Acc, Out], Size)
+    end;
+inflate_loop(Z, {finished, Out}, Acc, Size0) ->
+    case Size0 + iolist_size(Out) > ?MAX_XML_BYTES of
+        true -> {error, payload_too_large};
+        false ->
+            %% inflateEnd/1 raises data_error on a truncated stream.
+            ok = zlib:inflateEnd(Z),
+            {ok, iolist_to_binary([Acc, Out])}
+    end;
+inflate_loop(_Z, {need_dictionary, _, _}, _Acc, _Size) ->
+    erlang:error(data_error).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -415,5 +491,46 @@ xpath_text_test() ->
     Fun3 = ?xpath_text("/a/b[@name='bar']/c/text()", b, name),
     Rec3 = Fun3(Rec2),
     ?assertMatch(Rec2, Rec3).
+
+
+scan_untrusted_xml_accepts_valid_test() ->
+    Xml = <<"<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" Version=\"2.0\"/>">>,
+    ?assertMatch({ok, #xmlElement{name = 'samlp:Response'}}, scan_untrusted_xml(Xml)).
+
+scan_untrusted_xml_refuses_doctype_test() ->
+    ?assertEqual({error, doctype_not_allowed}, scan_untrusted_xml(<<"<!DOCTYPE r><r/>">>)),
+    ?assertEqual({error, doctype_not_allowed}, scan_untrusted_xml(<<"<!doctype r><r/>">>)),
+    ?assertEqual({error, doctype_not_allowed}, scan_untrusted_xml(<<"<r><!-- <!DOCTYPE r> --></r>">>)).
+
+scan_untrusted_xml_size_limit_test_() ->
+    {timeout, 60, fun() ->
+        Open = <<"<r>">>,
+        Close = <<"</r>">>,
+        Pad = 524288 - byte_size(Open) - byte_size(Close),
+        Max = <<Open/binary, (binary:copy(<<"a">>, Pad))/binary, Close/binary>>,
+        Over = <<Open/binary, (binary:copy(<<"a">>, Pad + 1))/binary, Close/binary>>,
+        ?assertEqual(524288, byte_size(Max)),
+        ?assertMatch({ok, #xmlElement{name = r}}, scan_untrusted_xml(Max)),
+        ?assertEqual({error, payload_too_large}, scan_untrusted_xml(Over))
+    end}.
+
+scan_untrusted_xml_refuses_nul_test() ->
+    Doc = <<"<!DOCTYPE r SYSTEM \"/nonexistent/esaml-test.dtd\"><r/>">>,
+    Utf16 = <<16#FE, 16#FF, (unicode:characters_to_binary(Doc, utf8, {utf16, big}))/binary>>,
+    ?assertEqual({error, encoding_not_allowed}, scan_untrusted_xml(Utf16)).
+
+scan_options_refuse_entities_test() ->
+    Xml = <<"<!DOCTYPE r [<!ENTITY x SYSTEM \"file:///etc/hosts\">]><r>&x;</r>">>,
+    ?assertMatch({error, {bad_xml, {{error, entities_not_allowed}, _, _, _}}}, scan_xml(Xml)).
+
+scan_options_refuse_external_dtd_test() ->
+    Xml = <<"<!DOCTYPE r SYSTEM \"/nonexistent/esaml-test.dtd\"><r/>">>,
+    ?assertMatch({error, {bad_xml, {{error_fetching_DTD, _}, _, _, _}}}, scan_xml(Xml)).
+
+bounded_inflate_test() ->
+    ?assertEqual({ok, <<"<r/>">>}, bounded_inflate(zlib:zip(<<"<r/>">>))),
+    Big = <<"<r>", (binary:copy(<<"a">>, 2 * 1024 * 1024))/binary, "</r>">>,
+    ?assertEqual({error, payload_too_large}, bounded_inflate(zlib:zip(Big))),
+    ?assertError(data_error, bounded_inflate(<<"<r/>">>)).
 
 -endif.
