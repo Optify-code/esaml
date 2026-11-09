@@ -100,6 +100,8 @@ nameid_format_map(S) when is_list(S) -> S.
 subject_method_map("urn:oasis:names:tc:SAML:2.0:cm:bearer") -> bearer;
 subject_method_map(_) -> unknown.
 
+%% A status code comes from an unsigned message, so it never becomes a new atom.
+%% The other SAML 2.0 status codes keep the atoms that esaml 4.6.0 gave them.
 -spec status_code_map(string()) -> status_code() | atom().
 status_code_map("urn:oasis:names:tc:SAML:2.0:status:Success") -> success;
 status_code_map("urn:oasis:names:tc:SAML:2.0:status:VersionMismatch") -> bad_version;
@@ -107,7 +109,23 @@ status_code_map("urn:oasis:names:tc:SAML:2.0:status:AuthnFailed") -> authn_faile
 status_code_map("urn:oasis:names:tc:SAML:2.0:status:InvalidAttrNameOrValue") -> bad_attr;
 status_code_map("urn:oasis:names:tc:SAML:2.0:status:RequestDenied") -> denied;
 status_code_map("urn:oasis:names:tc:SAML:2.0:status:UnsupportedBinding") -> bad_binding;
-status_code_map(Urn = "urn:" ++ _) -> list_to_atom(lists:last(string:tokens(Urn, ":")));
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:Requester") -> 'Requester';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:Responder") -> 'Responder';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:InvalidNameIDPolicy") -> 'InvalidNameIDPolicy';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:NoAuthnContext") -> 'NoAuthnContext';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:NoAvailableIDP") -> 'NoAvailableIDP';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:NoPassive") -> 'NoPassive';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:NoSupportedIDP") -> 'NoSupportedIDP';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:PartialLogout") -> 'PartialLogout';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:ProxyCountExceeded") -> 'ProxyCountExceeded';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:RequestUnsupported") -> 'RequestUnsupported';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:RequestVersionDeprecated") -> 'RequestVersionDeprecated';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:RequestVersionTooHigh") -> 'RequestVersionTooHigh';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:RequestVersionTooLow") -> 'RequestVersionTooLow';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:ResourceNotRecognized") -> 'ResourceNotRecognized';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:TooManyResponses") -> 'TooManyResponses';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:UnknownAttrProfile") -> 'UnknownAttrProfile';
+status_code_map("urn:oasis:names:tc:SAML:2.0:status:UnknownPrincipal") -> 'UnknownPrincipal';
 status_code_map(S) when is_list(S) -> unknown.
 
 -spec rev_status_code_map(status_code()) -> string().
@@ -128,7 +146,9 @@ logout_reason_map(S) when is_list(S) -> unknown.
 rev_logout_reason_map(user) -> "urn:oasis:names:tc:SAML:2.0:logout:user";
 rev_logout_reason_map(admin) -> "urn:oasis:names:tc:SAML:2.0:logout:admin".
 
--spec common_attrib_map(string()) -> atom().
+%% An attribute name that is not an atom yet stays a string, so an assertion
+%% cannot make new atoms. samly turns every key into a string either way.
+-spec common_attrib_map(string()) -> atom() | string().
 common_attrib_map("urn:oid:2.16.840.1.113730.3.1.3") -> employeeNumber;
 common_attrib_map("urn:oid:1.3.6.1.4.1.5923.1.1.1.6") -> eduPersonPrincipalName;
 common_attrib_map("urn:oid:0.9.2342.19200300.100.1.3") -> mail;
@@ -142,8 +162,13 @@ common_attrib_map("urn:oid:1.3.6.1.4.1.5923.1.1.1.9") -> eduPersonScopedAffiliat
 common_attrib_map("urn:oid:2.16.840.1.113730.3.1.4") -> employeeType;
 common_attrib_map("urn:oid:0.9.2342.19200300.100.1.1") -> uid;
 common_attrib_map("urn:oid:2.5.4.4") -> surName;
-common_attrib_map(Uri = "http://" ++ _) -> list_to_atom(lists:last(string:tokens(Uri, "/")));
-common_attrib_map(Other) when is_list(Other) -> list_to_atom(Other).
+common_attrib_map(Uri = "http://" ++ _) -> existing_atom_or_string(lists:last(string:tokens(Uri, "/")));
+common_attrib_map(Other) when is_list(Other) -> existing_atom_or_string(Other).
+
+existing_atom_or_string(Name) ->
+    try list_to_existing_atom(Name)
+    catch error:badarg -> Name
+    end.
 
 -include("xmerl_xpath_macros.hrl").
 
@@ -284,7 +309,7 @@ decode_assertion_conditions(Xml) ->
         end
     ], []).
 
--spec decode_assertion_attributes(#xmlElement{}) -> {ok, [{atom(), string()}]} | {error, term()}.
+-spec decode_assertion_attributes(#xmlElement{}) -> {ok, [{atom() | string(), string()}]} | {error, term()}.
 decode_assertion_attributes(Xml) ->
     Ns = [{"saml", 'urn:oasis:names:tc:SAML:2.0:assertion'}],
     Attrs = xmerl_xpath:string("/saml:AttributeStatement/saml:Attribute", Xml, [{namespace, Ns}]),
@@ -724,5 +749,21 @@ validate_stale_assertion_test() ->
                     } ]} ]} ]
     }),
     {error, stale_assertion} = validate_assertion(E1, "foobar", "foo").
+
+status_code_map_makes_no_new_atoms_test() ->
+    Code = "urn:oasis:names:tc:SAML:2.0:status:esamlfresh" ++ integer_to_list(erlang:unique_integer([positive])),
+    Before = erlang:system_info(atom_count),
+    ?assertEqual(unknown, status_code_map(Code)),
+    ?assertEqual(Before, erlang:system_info(atom_count)),
+    ?assertEqual('Requester', status_code_map("urn:oasis:names:tc:SAML:2.0:status:Requester")).
+
+common_attrib_map_makes_no_new_atoms_test() ->
+    Name = "esamlfresh" ++ integer_to_list(erlang:unique_integer([positive])),
+    Before = erlang:system_info(atom_count),
+    ?assertEqual(Name, common_attrib_map(Name)),
+    ?assertEqual(Name, common_attrib_map("http://schemas.example.com/claims/" ++ Name)),
+    ?assertEqual(Before, erlang:system_info(atom_count)),
+    ?assertEqual(mail, common_attrib_map("urn:oid:0.9.2342.19200300.100.1.3")),
+    ?assertEqual(emailaddress, common_attrib_map("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")).
 
 -endif.
