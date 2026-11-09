@@ -35,20 +35,33 @@ xml_payload_type(Xml) ->
         _ -> <<"SAMLRequest">>
     end.
 
-%% @doc Unpack and parse a SAMLResponse with given encoding
--spec decode_response(SAMLEncoding :: binary(), SAMLResponse :: binary()) -> #xmlDocument{}.
+%% @doc Unpack and parse a SAMLResponse with given encoding.
+%%
+%% Returns {error, Reason} when the payload is refused. The payload is refused
+%% when it is over 512 KB (before or after inflation), holds a NUL byte, or
+%% holds a DOCTYPE. Invalid base64 or invalid DEFLATE data still raise an error.
+-spec decode_response(SAMLEncoding :: binary(), SAMLResponse :: binary()) -> xml() | {error, term()}.
 decode_response(?deflate, SAMLResponse) ->
-	XmlData = binary_to_list(zlib:unzip(base64:decode(SAMLResponse))),
-	{Xml, _} = xmerl_scan:string(XmlData, [{namespace_conformant, true}]),
-    Xml;
+    case esaml_util:bounded_inflate(base64:decode(SAMLResponse)) of
+        {ok, XmlData} -> scan_payload(XmlData);
+        {error, _} = Error -> Error
+    end;
 decode_response(_, SAMLResponse) ->
-	Data = base64:decode(SAMLResponse),
-    XmlData = case (catch zlib:unzip(Data)) of
-        {'EXIT', _} -> binary_to_list(Data);
-        Bin -> binary_to_list(Bin)
-    end,
-	{Xml, _} = xmerl_scan:string(XmlData, [{namespace_conformant, true}]),
-    Xml.
+    Data = base64:decode(SAMLResponse),
+    case (catch esaml_util:bounded_inflate(Data)) of
+        {ok, XmlData} -> scan_payload(XmlData);
+        %% Too large after inflation: do not fall back to the raw data.
+        {error, _} = Error -> Error;
+        %% Not DEFLATE data: parse it as raw XML, as before.
+        {'EXIT', _} -> scan_payload(Data)
+    end.
+
+%% @private
+scan_payload(XmlData) ->
+    case esaml_util:scan_untrusted_xml(XmlData) of
+        {ok, Xml} -> Xml;
+        {error, _} = Error -> Error
+    end.
 
 %% @doc Encode a SAMLRequest (or SAMLResponse) as an HTTP-Redirect binding
 %%
@@ -117,5 +130,69 @@ document.getElementById('saml-req-form').submit();
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+response_xml() ->
+    <<"<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" "
+      "xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" Version=\"2.0\" "
+      "IssueInstant=\"2013-01-01T01:01:01Z\"><samlp:Status><samlp:StatusCode "
+      "Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/></samlp:Status>"
+      "</samlp:Response>">>.
+
+doctype_xml() ->
+    <<"<!DOCTYPE samlp:Response SYSTEM \"/nonexistent/esaml-test.dtd\">",
+      (response_xml())/binary>>.
+
+oversize_xml(Size) ->
+    Open = <<"<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\">">>,
+    Close = <<"</samlp:Response>">>,
+    <<Open/binary, (binary:copy(<<"a">>, Size))/binary, Close/binary>>.
+
+decode_response_accepts_valid_test() ->
+    Xml = response_xml(),
+    ?assertMatch(#xmlElement{name = 'samlp:Response'},
+                 decode_response(undefined, base64:encode(Xml))),
+    ?assertMatch(#xmlElement{name = 'samlp:Response'},
+                 decode_response(undefined, base64:encode(zlib:zip(Xml)))),
+    ?assertMatch(#xmlElement{name = 'samlp:Response'},
+                 decode_response(?deflate, base64:encode(zlib:zip(Xml)))).
+
+decode_response_refuses_doctype_test() ->
+    Xml = doctype_xml(),
+    ?assertEqual({error, doctype_not_allowed},
+                 decode_response(undefined, base64:encode(Xml))),
+    ?assertEqual({error, doctype_not_allowed},
+                 decode_response(?deflate, base64:encode(zlib:zip(Xml)))).
+
+decode_response_refuses_external_entity_test() ->
+    Xml = <<"<!DOCTYPE samlp:Response [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>"
+            "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" "
+            "Version=\"2.0\">&xxe;</samlp:Response>">>,
+    ?assertEqual({error, doctype_not_allowed},
+                 decode_response(undefined, base64:encode(Xml))),
+    ?assertEqual({error, doctype_not_allowed},
+                 decode_response(?deflate, base64:encode(zlib:zip(Xml)))).
+
+decode_response_refuses_oversize_test() ->
+    Xml = oversize_xml(600 * 1024),
+    ?assertEqual({error, payload_too_large},
+                 decode_response(undefined, base64:encode(Xml))).
+
+decode_response_refuses_inflated_oversize_test() ->
+    Zipped = zlib:zip(oversize_xml(2 * 1024 * 1024)),
+    ?assert(byte_size(Zipped) < 524288),
+    ?assertEqual({error, payload_too_large},
+                 decode_response(?deflate, base64:encode(Zipped))),
+    ?assertEqual({error, payload_too_large},
+                 decode_response(undefined, base64:encode(Zipped))).
+
+decode_response_refuses_utf16_test() ->
+    Utf16 = unicode:characters_to_binary(doctype_xml(), utf8, {utf16, big}),
+    ?assertEqual({error, encoding_not_allowed},
+                 decode_response(undefined, base64:encode(<<16#FE, 16#FF, Utf16/binary>>))),
+    ?assertEqual({error, encoding_not_allowed},
+                 decode_response(undefined, base64:encode(Utf16))).
+
+decode_response_bad_deflate_raises_test() ->
+    ?assertError(data_error, decode_response(?deflate, base64:encode(response_xml()))).
 
 -endif.
