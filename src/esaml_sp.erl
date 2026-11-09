@@ -274,10 +274,14 @@ validate_assertion(Xml, DuplicateFun, SP = #esaml_sp{}) ->
         fun(X) ->
             case xmerl_xpath:string("/samlp:Response/saml:EncryptedAssertion", X, [{namespace, Ns}]) of
                 [A1] ->
-                    try
-                        #xmlElement{} = DecryptedAssertion = decrypt_assertion(A1, SP),
-                        xmerl_xpath:string("/saml:Assertion", DecryptedAssertion, [{namespace, Ns}]) of
-                        [A2] -> A2
+                    try decrypt_assertion(A1, SP) of
+                        {ok, DecryptedAssertion} ->
+                            case xmerl_xpath:string("/saml:Assertion", DecryptedAssertion, [{namespace, Ns}]) of
+                                [A2] -> A2;
+                                _ -> {error, bad_assertion}
+                            end;
+                        {error, Reason} ->
+                            {error, Reason}
                     catch
                         _Error:_Reason -> {error, bad_assertion}
                     end;
@@ -323,6 +327,10 @@ validate_assertion(Xml, DuplicateFun, SP = #esaml_sp{}) ->
 
 
 %% @doc Decrypts an encrypted assertion element.
+%%
+%% The decrypted plaintext goes through esaml_util:scan_untrusted_xml/1.
+%% A refused plaintext returns {error, Reason}.
+-spec decrypt_assertion(#xmlElement{}, esaml:sp()) -> {ok, #xmlElement{}} | {error, term()}.
 decrypt_assertion(Xml, #esaml_sp{key = PrivateKey}) ->
     XencNs = [{"xenc", 'http://www.w3.org/2001/04/xmlenc#'}],
     [EncryptedData] = xmerl_xpath:string("./xenc:EncryptedData", Xml, [{namespace, XencNs}]),
@@ -331,8 +339,7 @@ decrypt_assertion(Xml, #esaml_sp{key = PrivateKey}) ->
     SymmetricKey = decrypt_key_info(EncryptedData, PrivateKey),
     [#xmlAttribute{value = Algorithm}] = xmerl_xpath:string("./xenc:EncryptionMethod/@Algorithm", EncryptedData, [{namespace, XencNs}]),
     AssertionXml = block_decrypt(Algorithm, SymmetricKey, CipherValue),
-    {Assertion, _} = xmerl_scan:string(AssertionXml, [{namespace_conformant, true}]),
-    Assertion.
+    esaml_util:scan_untrusted_xml(list_to_binary(AssertionXml)).
 
 
 decrypt_key_info(EncryptedData, Key) ->
@@ -390,5 +397,57 @@ validate_passes_decode_refusal_through_test() ->
     ?assertEqual({error, doctype_not_allowed}, validate_assertion(Refusal, #esaml_sp{})),
     ?assertEqual({error, doctype_not_allowed}, validate_logout_request(Refusal, #esaml_sp{})),
     ?assertEqual({error, doctype_not_allowed}, validate_logout_response(Refusal, #esaml_sp{})).
+
+encrypted_assertion_xml(Plain, Priv) ->
+    Pub = #'RSAPublicKey'{modulus = Priv#'RSAPrivateKey'.modulus,
+                          publicExponent = Priv#'RSAPrivateKey'.publicExponent},
+    K = crypto:strong_rand_bytes(16),
+    IV = crypto:strong_rand_bytes(12),
+    {CT, Tag} = crypto:crypto_one_time_aead(aes_128_gcm, K, IV, Plain, <<>>, true),
+    EK = public_key:encrypt_public(K, Pub, [{rsa_padding, rsa_pkcs1_oaep_padding}]),
+    <<"<saml:EncryptedAssertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">"
+      "<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\">"
+      "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/>"
+      "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><xenc:EncryptedKey>"
+      "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\"/>"
+      "<xenc:CipherData><xenc:CipherValue>", (base64:encode(EK))/binary,
+      "</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo>"
+      "<xenc:CipherData><xenc:CipherValue>", (base64:encode(<<IV/binary, CT/binary, Tag/binary>>))/binary,
+      "</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData></saml:EncryptedAssertion>">>.
+
+trusted_scan(Xml) ->
+    {Doc, _} = xmerl_scan:string(binary_to_list(Xml), [{namespace_conformant, true}]),
+    Doc.
+
+test_key() ->
+    public_key:generate_key({rsa, 2048, 65537}).
+
+assertion_plain() ->
+    <<"<saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" Version=\"2.0\"/>">>.
+
+decrypt_assertion_accepts_valid_test() ->
+    Priv = test_key(),
+    El = trusted_scan(encrypted_assertion_xml(assertion_plain(), Priv)),
+    ?assertMatch({ok, #xmlElement{name = 'saml:Assertion'}},
+                 decrypt_assertion(El, #esaml_sp{key = Priv})).
+
+decrypt_assertion_refuses_doctype_test() ->
+    Priv = test_key(),
+    Plain = <<"<!DOCTYPE saml:Assertion SYSTEM \"/nonexistent/esaml-test.dtd\">",
+              (assertion_plain())/binary>>,
+    Resp = <<"<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" "
+             "xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" Version=\"2.0\" "
+             "IssueInstant=\"2013-01-01T01:01:01Z\"><samlp:Status><samlp:StatusCode "
+             "Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/></samlp:Status>",
+             (encrypted_assertion_xml(Plain, Priv))/binary, "</samlp:Response>">>,
+    ?assertEqual({error, doctype_not_allowed},
+                 validate_assertion(trusted_scan(Resp), #esaml_sp{key = Priv})).
+
+decrypt_assertion_refuses_oversize_test() ->
+    Priv = test_key(),
+    Plain = <<"<saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">",
+              (binary:copy(<<"a">>, 600 * 1024))/binary, "</saml:Assertion>">>,
+    El = trusted_scan(encrypted_assertion_xml(Plain, Priv)),
+    ?assertEqual({error, payload_too_large}, decrypt_assertion(El, #esaml_sp{key = Priv})).
 
 -endif.
