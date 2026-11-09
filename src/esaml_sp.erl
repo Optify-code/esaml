@@ -160,8 +160,12 @@ setup(SP = #esaml_sp{trusted_fingerprints = FPs, metadata_uri = MetaURI,
     end.
 
 %% @doc Validate and parse a LogoutRequest element
--spec validate_logout_request(xml(), esaml:sp()) ->
+%%
+%% A decode refusal from esaml_binding:decode_response/2 comes back unchanged.
+-spec validate_logout_request(xml() | {error, term()}, esaml:sp()) ->
         {ok, esaml:logoutreq()} | {error, Reason :: term()}.
+validate_logout_request({error, Reason}, #esaml_sp{}) ->
+    {error, Reason};
 validate_logout_request(Xml, SP = #esaml_sp{}) ->
     Ns = [{"samlp", 'urn:oasis:names:tc:SAML:2.0:protocol'},
           {"saml", 'urn:oasis:names:tc:SAML:2.0:assertion'}],
@@ -191,8 +195,12 @@ validate_logout_request(Xml, SP = #esaml_sp{}) ->
     ], Xml).
 
 %% @doc Validate and parse a LogoutResponse element
--spec validate_logout_response(xml(), esaml:sp()) ->
+%%
+%% A decode refusal from esaml_binding:decode_response/2 comes back unchanged.
+-spec validate_logout_response(xml() | {error, term()}, esaml:sp()) ->
         {ok, esaml:logoutresp()} | {error, Reason :: term()}.
+validate_logout_response({error, Reason}, #esaml_sp{}) ->
+    {error, Reason};
 validate_logout_response(Xml, SP = #esaml_sp{}) ->
     Ns = [{"samlp", 'urn:oasis:names:tc:SAML:2.0:protocol'},
           {"saml", 'urn:oasis:names:tc:SAML:2.0:assertion'},
@@ -227,7 +235,7 @@ validate_logout_response(Xml, SP = #esaml_sp{}) ->
     ], Xml).
 
 %% @doc Validate and decode an assertion envelope in parsed XML
--spec validate_assertion(xml(), esaml:sp()) ->
+-spec validate_assertion(xml() | {error, term()}, esaml:sp()) ->
         {ok, esaml:assertion()} | {error, Reason :: term()}.
 validate_assertion(Xml, SP = #esaml_sp{}) ->
     validate_assertion(Xml, fun(_A, _Digest) -> ok end, SP).
@@ -236,8 +244,12 @@ validate_assertion(Xml, SP = #esaml_sp{}) ->
 %%
 %% The dupe_fun argument is intended to detect duplicate assertions
 %% in the case of a replay attack.
--spec validate_assertion(xml(), dupe_fun(), esaml:sp()) ->
+%%
+%% A decode refusal from esaml_binding:decode_response/2 comes back unchanged.
+-spec validate_assertion(xml() | {error, term()}, dupe_fun(), esaml:sp()) ->
         {ok, esaml:assertion()} | {error, Reason :: term()}.
+validate_assertion({error, Reason}, _DuplicateFun, #esaml_sp{}) ->
+    {error, Reason};
 validate_assertion(Xml, DuplicateFun, SP = #esaml_sp{}) ->
     Ns = [{"samlp", 'urn:oasis:names:tc:SAML:2.0:protocol'},
           {"saml", 'urn:oasis:names:tc:SAML:2.0:assertion'}],
@@ -369,5 +381,14 @@ block_decrypt("http://www.w3.org/2001/04/xmlenc#aes256-cbc", SymmetricKey, Ciphe
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+validate_passes_decode_refusal_through_test() ->
+    Doc = <<"<!DOCTYPE samlp:Response SYSTEM \"/nonexistent/esaml-test.dtd\">"
+            "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" Version=\"2.0\"/>">>,
+    Refusal = esaml_binding:decode_response(undefined, base64:encode(Doc)),
+    ?assertEqual({error, doctype_not_allowed}, Refusal),
+    ?assertEqual({error, doctype_not_allowed}, validate_assertion(Refusal, #esaml_sp{})),
+    ?assertEqual({error, doctype_not_allowed}, validate_logout_request(Refusal, #esaml_sp{})),
+    ?assertEqual({error, doctype_not_allowed}, validate_logout_response(Refusal, #esaml_sp{})).
 
 -endif.

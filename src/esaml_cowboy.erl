@@ -115,6 +115,8 @@ validate_logout(SP, SAMLEncoding, SAMLResponse, RelayState, Req2) ->
     case (catch esaml_binding:decode_response(SAMLEncoding, SAMLResponse)) of
         {'EXIT', Reason} ->
             {error, {bad_decode, Reason}, Req2};
+        {error, Reason} ->
+            {error, {bad_decode, Reason}, Req2};
         Xml ->
             Ns = [{"samlp", 'urn:oasis:names:tc:SAML:2.0:protocol'},
                   {"saml", 'urn:oasis:names:tc:SAML:2.0:assertion'}],
@@ -178,6 +180,8 @@ validate_assertion(SP, DuplicateFun, Custom_Response_Security_Callback, Callback
 
     case (catch esaml_binding:decode_response(SAMLEncoding, SAMLResponse)) of
         {'EXIT', Reason} ->
+            {error, {bad_decode, Reason}, Req2};
+        {error, Reason} ->
             {error, {bad_decode, Reason}, Req2};
         Xml ->
             case esaml_sp:validate_assertion(Xml, DuplicateFun, SP) of
