@@ -58,7 +58,7 @@
     </saml2:Subject>
     <saml2:Conditions NotBefore="2025-12-31T23:55:00.123Z" NotOnOrAfter="2026-01-01T00:05:00.123Z" xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion">
       <saml2:AudienceRestriction>
-        <saml2:Audience>urn:optify.io:production</saml2:Audience>
+        <saml2:Audience>urn:example:sp</saml2:Audience>
       </saml2:AudienceRestriction>
     </saml2:Conditions>
     <saml2:AuthnStatement AuthnInstant="2026-01-01T00:00:00.000Z" SessionIndex="_request-1" xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion">

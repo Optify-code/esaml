@@ -27,14 +27,14 @@
       </ds:KeyInfo>
     </ds:Signature>
     <saml:Subject>
-      <saml:NameID SPNameQualifier="urn:optify.local:samly_sp" Format="urn:oasis:names:tc:SAML:2.0:nameid-format:transient">_ce3d2948b4cf20146dee0a0b3dd6f69b6cf86f62d7</saml:NameID>
+      <saml:NameID SPNameQualifier="urn:example:sp" Format="urn:oasis:names:tc:SAML:2.0:nameid-format:transient">_ce3d2948b4cf20146dee0a0b3dd6f69b6cf86f62d7</saml:NameID>
       <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
         <saml:SubjectConfirmationData NotOnOrAfter="2026-01-01T00:05:00Z" Recipient="https://sp.example.com/saml2/sp/consume/idp" InResponseTo="_request-1"/>
       </saml:SubjectConfirmation>
     </saml:Subject>
     <saml:Conditions NotBefore="2025-12-31T23:59:30Z" NotOnOrAfter="2026-01-01T00:05:00Z">
       <saml:AudienceRestriction>
-        <saml:Audience>urn:optify.local:samly_sp</saml:Audience>
+        <saml:Audience>urn:example:sp</saml:Audience>
       </saml:AudienceRestriction>
     </saml:Conditions>
     <saml:AuthnStatement AuthnInstant="2026-01-01T00:00:00Z" SessionNotOnOrAfter="2026-01-01T08:00:00Z" SessionIndex="_be9967abd904ddcae3c0eb4189adbe3f71e327cf93">
